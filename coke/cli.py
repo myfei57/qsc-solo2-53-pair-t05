@@ -96,7 +96,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "quench": {"ok": quench["ok"], "steps": [step["action"] for step in quench["steps"]]},
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
-        "cleaning": {"ok": cleaning["ok"], "steps": [step["action"] for step in cleaning["steps"]]},
+        "cleaning": {
+            "ok": cleaning["ok"],
+            "steps": [step["action"] for step in cleaning["steps"]],
+            "seal_verdict": cleaning.get("seal_verdict"),
+            "seal_action": cleaning.get("seal_action"),
+        },
         "concurrency": concurrency,
         "calibration": calibration,
         "shutdown": shutdown,

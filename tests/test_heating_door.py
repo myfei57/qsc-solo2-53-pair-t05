@@ -80,14 +80,17 @@ def test_door_clean_requires_loosened_latch():
     door.open_door("oven01")
     with pytest.raises(InterlockError):
         door.clean(1.0)
-    report = clean_door(door, "oven01")
+    report = clean_door(door, "oven01", sampler=lambda: 30.0)
     assert report["ok"] is True
     order = [step["action"] for step in report["steps"]]
     assert order.index("release_latch") < order.index("open_door")
     assert order.index("open_door") < order.index("clean")
     assert order.index("clean") < order.index("close_door")
+    assert order.index("close_door") < order.index("seal_check")
     assert door.latch.is_engaged() is True
     assert door.latch.cycles() == 1
+    assert report["seal_verdict"] == "sealed"
+    assert report["seal_action"] == "pass"
 
 
 def test_mark_cleaned_requires_completion():

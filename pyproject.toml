@@ -24,6 +24,7 @@ packages = [
     "coke.door",
     "coke.heating",
     "coke.dust",
+    "coke.seal",
     "coke.sequence",
     "coke.console",
 ]

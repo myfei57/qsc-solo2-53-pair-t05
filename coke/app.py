@@ -39,6 +39,14 @@ from .pusher.machine import PusherMachine
 from .pusher.speed import SpeedArbiter
 from .pusher.stroke import StrokeBaseline
 from .quench.machine import QuenchCar
+from .seal.history import SealHistory
+from .seal.record import SealRecord
+from .seal.verdict import (
+    ACTION_PASS,
+    ACTION_REPRESS,
+    AUTO,
+    JUDGE_SCOPE,
+)
 from .sequence import charge_oven, clean_door, push_oven, quench_oven, reverse_heating
 from .store.journal import JsonlJournal
 from .store.jsonfile import JsonStore
@@ -65,10 +73,12 @@ class Platform:
         store = JsonStore(self.config.storage_root)
         self.store = store
         self.audit = AuditLog(self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512))
+        self.seals = SealHistory(JsonlJournal(store.root, "seal", segment_limit=512))
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
         self.trend = TrendBuffer(period_s=5.0)
         self.ids = IdFactory("op")
+        self.verdict_ids = IdFactory("seal")
 
         self.pusher = PusherMachine(self.config.pusher)
         self.stroke = StrokeBaseline(
@@ -295,17 +305,105 @@ class Platform:
             self._persist()
             return {**report, **summary}
 
-    def clean(self, oven: str = DEFAULT_OVEN, dt: float = 1.0) -> dict:
-        """炉门清扫编排：松开闩锁 → 开炉门 → 清扫 → 复位闩锁。"""
+    def clean(
+        self,
+        oven: str = DEFAULT_OVEN,
+        dt: float = 1.0,
+        pressure_before: object = AUTO,
+        pressure_after: object = AUTO,
+        clamp_readback: object = AUTO,
+        sampler=None,
+    ) -> dict:
+        """炉门清扫编排：松开闩锁 → 开炉门 → 清扫 → 复位闩锁 → 逐门密封判定。
+
+        清扫前后压差缺省取集气管现成压力（不加硬件）；显式传 None 可注入该路
+        采样失败，压紧行程回读同理。``sampler`` 缺省绑定集气管压力，标定／验证
+        时可替换。判定结论落不可变档案并写审计，再压紧产生新结论并链接上一条。
+        """
 
         with self._lock:
             op_id = self.ids.next()
-            report = clean_door(self.door, oven, dt)
+            report = clean_door(
+                self.door,
+                oven,
+                dt,
+                seal=self.config.seal,
+                pressure_before=pressure_before,
+                pressure_after=pressure_after,
+                clamp_readback=clamp_readback,
+                sampler=sampler or (lambda: self.collector.pressure_pa),
+            )
+            seal_records = self._record_seal_attempts(op_id, report)
             summary = self._record_operation(op_id, "clean", report)
             summary["op_id"] = op_id
+            summary["seal_verdict"] = report.get("seal_verdict")
+            summary["seal_action"] = report.get("seal_action")
+            summary["seal_verdict_ids"] = [item["verdict_id"] for item in seal_records]
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def _record_seal_attempts(self, op_id: str, report: dict) -> list[dict]:
+        """把每次密封判定的依据与结论落不可变档案并发布审计事件。"""
+
+        records: list[dict] = []
+        parent_id: str | None = None
+        oven = str(report.get("oven", ""))
+        for attempt in report.get("seal_attempts", []):
+            verdict_id = self.verdict_ids.next()
+            evidence = attempt.get("evidence", {})
+            seal_record = SealRecord.create(
+                ts=self.clock.now(),
+                verdict_id=verdict_id,
+                op_id=op_id,
+                oven=oven,
+                attempt=attempt["attempt"],
+                verdict=attempt["verdict"],
+                action=attempt["action"],
+                reasons=attempt.get("reasons", ()),
+                repress_escalated=attempt.get("repress_escalated", False),
+                evidence=evidence,
+                parent_id=parent_id,
+                policy=attempt.get("policy", {}),
+                scope=JUDGE_SCOPE,
+            )
+            records.append(self.seals.append(seal_record))
+
+            action = attempt["action"]
+            if action == ACTION_PASS:
+                event_action, severity = "seal_passed", "notice"
+                message = f"{oven} 炉门密封合格（第 {attempt['attempt']} 次判定）"
+            elif action == ACTION_REPRESS:
+                event_action, severity = "seal_repress", "warning"
+                message = f"{oven} 炉门判定 {attempt['verdict']}，按炉门策略重新压紧"
+            else:
+                event_action, severity = "seal_alarm", "alarm"
+                message = f"{oven} 炉门密封报警：{','.join(attempt.get('reasons', ()))}"
+            self.bus.publish(
+                Event.of(
+                    "door",
+                    "door",
+                    event_action,
+                    oven=oven,
+                    op_id=op_id,
+                    severity=severity,
+                    message=message,
+                    verdict_id=verdict_id,
+                    parent_id=parent_id or "",
+                    scope=JUDGE_SCOPE,
+                    attempt=attempt["attempt"],
+                    verdict=attempt["verdict"],
+                    seal_action=action,
+                    repress_escalated=attempt.get("repress_escalated", False),
+                    reasons=",".join(attempt.get("reasons", ())),
+                    latch_readback_mm=evidence.get("latch_readback_mm"),
+                    pressure_before_pa=evidence.get("pressure_before_pa"),
+                    pressure_after_pa=evidence.get("pressure_after_pa"),
+                    pressure_delta_pa=evidence.get("pressure_delta_pa"),
+                )
+            )
+            parent_id = verdict_id
+        return records
 
     def cycle(self, dt: float = 1.0) -> dict:
         """推进一个控制周期，返回本周期摘要。"""
@@ -482,6 +580,12 @@ class Platform:
                 "latch_resets": self.flap.latch.resets(),
             },
             "door": {**self.door.snapshot().as_dict(), "latch_cycles": self.door.latch.cycles()},
+            "seal": {
+                "scope": self.config.seal.scope,
+                "config": self.config.seal.as_dict(),
+                "total": self.seals.count(),
+                "latest_by_oven": self.seals.latest_by_oven(),
+            },
             "heating": self.heating_snapshot().as_dict(),
             "dust": self.dust_snapshot().as_dict(),
             "dust_starts": self.dust.starts(),

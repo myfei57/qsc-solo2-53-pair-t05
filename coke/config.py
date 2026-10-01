@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from .errors import ConfigError
+from .seal.policy import SealConfig, default_seal_config
 
 _MISSING = object()
 
@@ -226,6 +227,7 @@ class PlatformConfig:
     door: DoorLimits
     heating: HeatingLimits
     dust: DustLimits
+    seal: SealConfig
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any]) -> "PlatformConfig":
@@ -238,6 +240,8 @@ class PlatformConfig:
             raise ConfigError("platform.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        seal_section = mapping.get("seal")
+        seal = SealConfig.from_mapping(seal_section) if isinstance(seal_section, Mapping) else default_seal_config()
         return cls(
             name=name,
             storage_root=storage_root,
@@ -249,6 +253,7 @@ class PlatformConfig:
             door=DoorLimits.from_mapping(_section(limits, "door")),
             heating=HeatingLimits.from_mapping(_section(limits, "heating")),
             dust=DustLimits.from_mapping(_section(limits, "dust")),
+            seal=seal,
         )
 
 
@@ -278,6 +283,7 @@ def default_config() -> PlatformConfig:
         door=DoorLimits(60.0, 45.0),
         heating=HeatingLimits(1800.0, 1180.0, 35.0, 4.0),
         dust=DustLimits(70.0, 14.0, 1.5),
+        seal=default_seal_config(),
     )
 
 
@@ -332,4 +338,5 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "linkage_lag_s": cfg.dust.linkage_lag_s,
             },
         },
+        "seal": cfg.seal.as_dict(),
     }

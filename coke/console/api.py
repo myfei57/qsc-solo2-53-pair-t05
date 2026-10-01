@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from ..app import Platform
 from ..audit.timeline import build_timeline
+from ..door.latch import DoorLatch
 from ..errors import CokeError
+from ..seal.verdict import AUTO
 from .router import Router
 
 
@@ -18,6 +20,20 @@ def _as_float(body: dict, key: str, default: float) -> float:
         return float(value)
     except (TypeError, ValueError) as error:
         raise CokeError(f"参数 {key!r} 必须是数值", component="console") from error
+
+
+def _signal(body: dict, key: str, nominal: object = AUTO) -> object:
+    """解析一路可选信号：缺省自动采样，null 表示采样失败，数值按回读判定。"""
+
+    if key not in body:
+        return nominal
+    value = body[key]
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as error:
+        raise CokeError(f"参数 {key!r} 必须是数值或 null", component="console") from error
 
 
 class Api:
@@ -40,6 +56,8 @@ class Api:
         add("GET", "/api/namespaces", lambda params, body: self._platform.namespaces_describe())
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/alarms", lambda params, body: {"alarms": self._platform.audit.alarms()})
+        add("GET", "/api/seals", self._seals)
+        add("GET", "/api/seal/{oven}", self._seal_latest)
         add("GET", "/api/events", self._events)
         add("GET", "/api/trend", self._trend)
         add("GET", "/api/store", self._store)
@@ -173,8 +191,22 @@ class Api:
 
     def _clean(self, params: dict, body: dict) -> dict:
         return self._platform.clean(
-            oven=str(body.get("oven", "oven01")), dt=_as_float(body, "dt", 1.0)
+            oven=str(body.get("oven", "oven01")),
+            dt=_as_float(body, "dt", 1.0),
+            pressure_before=_signal(body, "pressure_before_pa"),
+            pressure_after=_signal(body, "pressure_after_pa"),
+            clamp_readback=_signal(body, "clamp_readback_mm", nominal=DoorLatch.NOMINAL),
         )
+
+    def _seals(self, params: dict, body: dict) -> dict:
+        oven = params.get("oven")
+        limit_value = params.get("limit")
+        limit = None if limit_value is None else int(limit_value)
+        return {"scope": self._platform.config.seal.scope, "seals": self._platform.seals.entries(oven, limit)}
+
+    def _seal_latest(self, params: dict, body: dict) -> dict:
+        oven = params["oven"]
+        return {"scope": self._platform.config.seal.scope, "oven": oven, "latest": self._platform.seals.latest_for(oven)}
 
     def _calibrate(self, params: dict, body: dict) -> dict:
         return self._platform.calibrate_stroke(_as_float(body, "value_mm", self._platform.stroke.baseline_mm))

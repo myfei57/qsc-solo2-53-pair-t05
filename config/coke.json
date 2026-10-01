@@ -48,5 +48,17 @@
       "damper_rate_deg_per_s": 14.0,
       "linkage_lag_s": 1.5
     }
+  },
+  "seal": {
+    "scope": "door",
+    "latch_tolerance_mm": 2.0,
+    "pressure_band_pa": 5.0,
+    "leak_delta_pa": 15.0,
+    "max_repress": 1,
+    "default_policy": {
+      "on_leak": "repress",
+      "on_inconclusive": "alarm"
+    },
+    "oven_policies": {}
   }
 }

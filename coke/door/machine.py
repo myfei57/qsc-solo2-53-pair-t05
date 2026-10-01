@@ -1,7 +1,8 @@
 """炉门清扫机状态机。
 
 清扫头只有在炉门打开、闩锁松开之后才能伸入；清扫进度按清扫时长累计，达到
-设定时长即完成。清扫完成由编排把闩锁重新压紧，机内只记录是否清完。
+设定时长即完成。清扫完成由编排把闩锁重新压紧，机内只记录是否清完。压紧后
+密封是否合格不属于本机职责，由编排结合闩锁行程回读与清扫前后压差判定。
 """
 
 from __future__ import annotations
@@ -51,12 +52,15 @@ class DoorCleaner:
         self._elapsed_s += dt
         return self.progress()
 
-    def close_door(self) -> None:
-        """关闭炉门；清扫完成后由编排压紧闩锁。"""
+    def close_door(self, readback_mm: float | object | None = DoorLatch.NOMINAL) -> None:
+        """关闭炉门；清扫完成后由编排压紧闩锁。
+
+        ``readback_mm`` 透传给闩锁：显式 ``None`` 表示压紧行程回读失败。
+        """
 
         self._door_open = False
         if self._cleaned:
-            self._latch.set_engaged()
+            self._latch.set_engaged(readback_mm)
 
     def progress(self) -> float:
         """返回清扫进度（0–1）。"""
@@ -93,6 +97,8 @@ class DoorCleaner:
             door_open=self._door_open,
             latch_engaged=self._latch.is_engaged(),
             latch_position_mm=self._latch.position_mm,
+            latch_readback_ok=self._latch.readback_ok,
+            latch_readback_mm=self._latch.engaged_readback_mm(),
             cleaned=self._cleaned,
             progress=self.progress(),
             cycles=self._cycles,

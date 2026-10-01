@@ -13,6 +13,8 @@ class DoorSnapshot:
     door_open: bool
     latch_engaged: bool
     latch_position_mm: float
+    latch_readback_ok: bool
+    latch_readback_mm: float | None
     cleaned: bool
     progress: float
     cycles: int
@@ -23,6 +25,10 @@ class DoorSnapshot:
             "door_open": self.door_open,
             "latch_engaged": self.latch_engaged,
             "latch_position_mm": round(self.latch_position_mm, 2),
+            "latch_readback_ok": self.latch_readback_ok,
+            "latch_readback_mm": (
+                None if self.latch_readback_mm is None else round(self.latch_readback_mm, 2)
+            ),
             "cleaned": self.cleaned,
             "progress": round(self.progress, 3),
             "cycles": self.cycles,
