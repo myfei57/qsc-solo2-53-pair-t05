@@ -20,6 +20,16 @@ def _as_float(body: dict, key: str, default: float) -> float:
         raise CokeError(f"参数 {key!r} 必须是数值", component="console") from error
 
 
+def _optional_float(body: dict, key: str) -> float | None:
+    value = body.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as error:
+        raise CokeError(f"参数 {key!r} 必须是数值", component="console") from error
+
+
 class Api:
     """把 HTTP 请求翻译成平台调用。"""
 
@@ -45,6 +55,8 @@ class Api:
         add("GET", "/api/store", self._store)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
+        add("GET", "/api/leak", lambda params, body: self._platform.leak_status())
+        add("GET", "/api/leak/history", self._leak_history)
         add("GET", "/api/readiness", self._readiness)
         add("POST", "/api/step", self._step)
         add("POST", "/api/charge", self._charge)
@@ -173,8 +185,17 @@ class Api:
 
     def _clean(self, params: dict, body: dict) -> dict:
         return self._platform.clean(
-            oven=str(body.get("oven", "oven01")), dt=_as_float(body, "dt", 1.0)
+            oven=str(body.get("oven", "oven01")),
+            dt=_as_float(body, "dt", 1.0),
+            latch_readback_mm=_optional_float(body, "latch_readback_mm"),
+            pressure_before_pa=_optional_float(body, "pressure_before_pa"),
+            pressure_after_pa=_optional_float(body, "pressure_after_pa"),
+            latch_readback_ok=bool(body.get("latch_readback_ok", True)),
+            pressure_sample_ok=bool(body.get("pressure_sample_ok", True)),
         )
+
+    def _leak_history(self, params: dict, body: dict) -> dict:
+        return self._platform.door_leak_history(str(params.get("oven", "")))
 
     def _calibrate(self, params: dict, body: dict) -> dict:
         return self._platform.calibrate_stroke(_as_float(body, "value_mm", self._platform.stroke.baseline_mm))

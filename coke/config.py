@@ -39,6 +39,22 @@ def _number(section: Mapping[str, Any], key: str, *, minimum: float | None = Non
     return number
 
 
+def _integer(section: Mapping[str, Any], key: str, *, minimum: int = 0) -> int:
+    number = _number(section, key, minimum=float(minimum))
+    if not number.is_integer():
+        raise ConfigError(f"配置字段 {key!r} 必须是整数", component="config")
+    return int(number)
+
+
+def _choice(section: Mapping[str, Any], key: str, choices: tuple[str, ...]) -> str:
+    value = section.get(key, _MISSING)
+    if value is _MISSING:
+        raise ConfigError(f"配置缺少字段 {key!r}", component="config")
+    if not isinstance(value, str) or value not in choices:
+        raise ConfigError(f"配置字段 {key!r} 必须是 {choices} 之一", component="config")
+    return value
+
+
 @dataclass(frozen=True)
 class PusherLimits:
     """推焦机行程与速度约束。"""
@@ -165,6 +181,135 @@ class DoorLimits:
         )
 
 
+#: 判不准时的处置策略取值：再压紧一次 / 直接报警。
+UNCERTAIN_POLICIES = ("re_tighten_once", "alarm")
+
+_LEAK_NUMERIC_MINIMUMS = {
+    "travel_pass_mm": 1.0,
+    "travel_fail_mm": 0.0,
+    "dp_drop_pass_pa": 0.0,
+    "dp_drop_fail_pa": 0.0,
+}
+_LEAK_OVERRIDE_FIELDS = tuple(_LEAK_NUMERIC_MINIMUMS) + ("on_uncertain", "max_retighten")
+
+
+@dataclass(frozen=True)
+class DoorLeakPolicy:
+    """单门泄漏判定的生效策略（默认策略按炉门覆盖后得到）。
+
+    行程回读 ≥ ``travel_pass_mm`` 为合格、< ``travel_fail_mm`` 为硬失败，其间
+    为灰区；压差下降 ≤ ``dp_drop_pass_pa`` 为合格、> ``dp_drop_fail_pa`` 为
+    硬失败，其间为灰区。``on_uncertain`` 决定判不准时是再压紧一次还是直接
+    报警，``max_retighten`` 是每轮清扫允许重新压紧的次数上限。
+    """
+
+    travel_pass_mm: float
+    travel_fail_mm: float
+    dp_drop_pass_pa: float
+    dp_drop_fail_pa: float
+    on_uncertain: str
+    max_retighten: int
+
+    def __post_init__(self) -> None:
+        if self.travel_fail_mm > self.travel_pass_mm:
+            raise ConfigError("闩锁行程硬失败阈不得高于合格阈", component="config")
+        if self.dp_drop_pass_pa > self.dp_drop_fail_pa:
+            raise ConfigError("压差合格阈不得高于硬失败阈", component="config")
+        if self.on_uncertain not in UNCERTAIN_POLICIES:
+            raise ConfigError(f"判不准策略必须是 {UNCERTAIN_POLICIES} 之一", component="config")
+        if isinstance(self.max_retighten, bool) or not float(self.max_retighten).is_integer():
+            raise ConfigError("重新压紧预算必须是整数", component="config")
+        if self.max_retighten < 0:
+            raise ConfigError("重新压紧预算不得为负", component="config")
+
+    def as_dict(self) -> dict:
+        """转成可落审计、可展示的字典。"""
+
+        return {
+            "travel_pass_mm": self.travel_pass_mm,
+            "travel_fail_mm": self.travel_fail_mm,
+            "dp_drop_pass_pa": self.dp_drop_pass_pa,
+            "dp_drop_fail_pa": self.dp_drop_fail_pa,
+            "on_uncertain": self.on_uncertain,
+            "max_retighten": int(self.max_retighten),
+        }
+
+
+def _leak_override(section: Mapping[str, Any], oven: str) -> Mapping[str, Any]:
+    """校验并规范化一门的覆盖字段，未知字段或越界取值在装配期就拦下。"""
+
+    unknown = set(section) - set(_LEAK_OVERRIDE_FIELDS)
+    if unknown:
+        raise ConfigError(f"炉门 {oven!r} 的泄漏判定覆盖含未知字段 {sorted(unknown)}", component="config")
+    cleaned: dict[str, Any] = {}
+    for key, minimum in _LEAK_NUMERIC_MINIMUMS.items():
+        if key in section:
+            cleaned[key] = _number(section, key, minimum=minimum)
+    if "on_uncertain" in section:
+        cleaned["on_uncertain"] = _choice(section, "on_uncertain", UNCERTAIN_POLICIES)
+    if "max_retighten" in section:
+        cleaned["max_retighten"] = _integer(section, "max_retighten", minimum=0)
+    return cleaned
+
+
+@dataclass(frozen=True)
+class LeakLimits:
+    """炉门泄漏判定约束：默认策略加上按炉门覆盖（判不准处置按炉门定）。"""
+
+    travel_pass_mm: float
+    travel_fail_mm: float
+    dp_drop_pass_pa: float
+    dp_drop_fail_pa: float
+    on_uncertain: str
+    max_retighten: int
+    doors: Mapping[str, Mapping[str, Any]]
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "LeakLimits":
+        base = DoorLeakPolicy(
+            travel_pass_mm=_number(section, "travel_pass_mm", minimum=1.0),
+            travel_fail_mm=_number(section, "travel_fail_mm", minimum=0.0),
+            dp_drop_pass_pa=_number(section, "dp_drop_pass_pa", minimum=0.0),
+            dp_drop_fail_pa=_number(section, "dp_drop_fail_pa", minimum=0.0),
+            on_uncertain=_choice(section, "on_uncertain", UNCERTAIN_POLICIES),
+            max_retighten=_integer(section, "max_retighten", minimum=0),
+        )
+        raw_doors = section.get("doors", {})
+        if not isinstance(raw_doors, Mapping):
+            raise ConfigError("leak.doors 必须是映射", component="config")
+        doors: dict[str, Mapping[str, Any]] = {}
+        for oven, override in raw_doors.items():
+            if not isinstance(override, Mapping):
+                raise ConfigError(f"炉门 {oven!r} 的泄漏判定覆盖必须是映射", component="config")
+            cleaned = _leak_override(override, str(oven))
+            # 覆盖后的组合也必须合法，装配期就拦下，不允许带病启动。
+            DoorLeakPolicy(**{**base.as_dict(), **cleaned})
+            doors[str(oven)] = cleaned
+        return cls(
+            travel_pass_mm=base.travel_pass_mm,
+            travel_fail_mm=base.travel_fail_mm,
+            dp_drop_pass_pa=base.dp_drop_pass_pa,
+            dp_drop_fail_pa=base.dp_drop_fail_pa,
+            on_uncertain=base.on_uncertain,
+            max_retighten=base.max_retighten,
+            doors=doors,
+        )
+
+    def policy_for(self, oven: str) -> DoorLeakPolicy:
+        """返回指定炉门的生效判定策略（默认策略按炉门覆盖）。"""
+
+        merged = {
+            "travel_pass_mm": self.travel_pass_mm,
+            "travel_fail_mm": self.travel_fail_mm,
+            "dp_drop_pass_pa": self.dp_drop_pass_pa,
+            "dp_drop_fail_pa": self.dp_drop_fail_pa,
+            "on_uncertain": self.on_uncertain,
+            "max_retighten": self.max_retighten,
+        }
+        merged.update(self.doors.get(oven, {}))
+        return DoorLeakPolicy(**merged)
+
+
 @dataclass(frozen=True)
 class HeatingLimits:
     """加热换向与炉温确认约束。"""
@@ -224,6 +369,7 @@ class PlatformConfig:
     quench: QuenchLimits
     collector: CollectorLimits
     door: DoorLimits
+    leak: LeakLimits
     heating: HeatingLimits
     dust: DustLimits
 
@@ -247,6 +393,7 @@ class PlatformConfig:
             quench=QuenchLimits.from_mapping(_section(limits, "quench")),
             collector=CollectorLimits.from_mapping(_section(limits, "collector")),
             door=DoorLimits.from_mapping(_section(limits, "door")),
+            leak=LeakLimits.from_mapping(_section(limits, "leak")),
             heating=HeatingLimits.from_mapping(_section(limits, "heating")),
             dust=DustLimits.from_mapping(_section(limits, "dust")),
         )
@@ -276,6 +423,7 @@ def default_config() -> PlatformConfig:
         quench=QuenchLimits(42.0, 1.6, 90.0, 320.0),
         collector=CollectorLimits(90.0, 18.0, 6.0),
         door=DoorLimits(60.0, 45.0),
+        leak=LeakLimits(58.0, 54.0, 5.0, 15.0, "re_tighten_once", 1, {}),
         heating=HeatingLimits(1800.0, 1180.0, 35.0, 4.0),
         dust=DustLimits(70.0, 14.0, 1.5),
     )
@@ -319,6 +467,15 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
             "door": {
                 "latch_travel_mm": cfg.door.latch_travel_mm,
                 "clean_duration_s": cfg.door.clean_duration_s,
+            },
+            "leak": {
+                "travel_pass_mm": cfg.leak.travel_pass_mm,
+                "travel_fail_mm": cfg.leak.travel_fail_mm,
+                "dp_drop_pass_pa": cfg.leak.dp_drop_pass_pa,
+                "dp_drop_fail_pa": cfg.leak.dp_drop_fail_pa,
+                "on_uncertain": cfg.leak.on_uncertain,
+                "max_retighten": cfg.leak.max_retighten,
+                "doors": {oven: dict(override) for oven, override in cfg.leak.doors.items()},
             },
             "heating": {
                 "reversal_interval_s": cfg.heating.reversal_interval_s,

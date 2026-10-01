@@ -17,6 +17,15 @@ from .charger.machine import ChargingCar
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config
 from .door.latch import DoorLatch
+from .door.leak import (
+    ACTION_RE_TIGHTEN,
+    ACTION_SEVERITIES,
+    GRANULARITY as LEAK_GRANULARITY,
+    VERDICT_MESSAGES,
+    LeakEvidence,
+    LeakRegister,
+    judge_leak,
+)
 from .door.machine import DoorCleaner
 from .dust.damper import DustDamper
 from .dust.schedule import DamperSchedule
@@ -85,6 +94,7 @@ class Platform:
         self.collector = CollectorMain(self.config.collector)
         self.flap = BridgeFlap(FlapLatch())
         self.door = DoorCleaner(self.config.door, DoorLatch(self.config.door.latch_travel_mm))
+        self.leak_register = LeakRegister()
         self.reversal = HeatingReversal(self.config.heating, self.clock)
         self.valves = ValveTrain()
         self.temperature = OvenTemperature(self.config.heating)
@@ -126,6 +136,10 @@ class Platform:
         # 时间戳属于过期状态，不能拿它把换向间隔计时顶到当前时刻之前。
         if reversals and reversals[-1].ts <= self.clock.now():
             self.reversal.mark_reversed(reversals[-1].ts)
+        # 泄漏判定台账从落盘流水重建：历史结论只追加不改写，重启后仍可复查。
+        for item in records:
+            if item.action == "leak_verdict":
+                self.leak_register.append(item.oven, {"ts": item.ts, "oven": item.oven, **item.payload})
         state = self.store.read("platform_state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
@@ -295,17 +309,137 @@ class Platform:
             self._persist()
             return {**report, **summary}
 
-    def clean(self, oven: str = DEFAULT_OVEN, dt: float = 1.0) -> dict:
-        """炉门清扫编排：松开闩锁 → 开炉门 → 清扫 → 复位闩锁。"""
+    def clean(
+        self,
+        oven: str = DEFAULT_OVEN,
+        dt: float = 1.0,
+        *,
+        latch_readback_mm: float | None = None,
+        pressure_before_pa: float | None = None,
+        pressure_after_pa: float | None = None,
+        latch_readback_ok: bool = True,
+        pressure_sample_ok: bool = True,
+    ) -> dict:
+        """炉门清扫编排：松开闩锁 → 开炉门 → 清扫 → 复位闩锁 → 泄漏判定。
+
+        压紧之后立即用闩锁行程回读与清扫前后压差判定密封（逐门独立判定）；
+        判不准时按炉门策略再压紧一次或直接报警，采样／回读失败一律报警，
+        每次判定的依据与结论都落审计。
+        """
 
         with self._lock:
             op_id = self.ids.next()
+            pressure_before = (
+                self.collector.pressure_pa if pressure_before_pa is None else float(pressure_before_pa)
+            )
             report = clean_door(self.door, oven, dt)
             summary = self._record_operation(op_id, "clean", report)
             summary["op_id"] = op_id
+            if report["ok"]:
+                report["leak"] = self._judge_door_leak(
+                    oven,
+                    op_id,
+                    pressure_before_pa=pressure_before,
+                    pressure_after_pa=pressure_after_pa,
+                    latch_readback_mm=latch_readback_mm,
+                    latch_readback_ok=latch_readback_ok,
+                    pressure_sample_ok=pressure_sample_ok,
+                )
             self._operations += 1
             self._persist()
             return {**report, **summary}
+
+    def _judge_door_leak(
+        self,
+        oven: str,
+        op_id: str,
+        *,
+        pressure_before_pa: float,
+        pressure_after_pa: float | None,
+        latch_readback_mm: float | None,
+        latch_readback_ok: bool,
+        pressure_sample_ok: bool,
+    ) -> dict:
+        """逐门泄漏判定循环：判定 → 落审计 → 按结论重新压紧或收尾。
+
+        注入的现场读数只对首次判定生效；系统决定重新压紧后，重新读活信号
+        再判，直到合格、报警或压紧预算耗尽。
+        """
+
+        policy = self.config.leak.policy_for(oven)
+        attempts: list[dict] = []
+        retightens_used = 0
+        while True:
+            evidence = LeakEvidence(
+                latch_readback_mm=self._latch_readback(latch_readback_mm, latch_readback_ok, retightens_used),
+                pressure_before_pa=pressure_before_pa if pressure_sample_ok else None,
+                pressure_after_pa=self._pressure_after(pressure_after_pa, pressure_sample_ok, retightens_used),
+            )
+            judgment = judge_leak(evidence, policy, retightens_used)
+            record = {
+                "oven": oven,
+                "op_id": op_id,
+                "attempt": len(attempts),
+                "granularity": LEAK_GRANULARITY,
+                "verdict": judgment.verdict,
+                "decision": judgment.action,
+                "reasons": list(judgment.reasons),
+                "dp_drop_pa": judgment.dp_drop_pa,
+                "evidence": evidence.as_dict(),
+                "policy": policy.as_dict(),
+                "retightens_used": retightens_used,
+            }
+            # 依据与结论同时落台账与审计流水；已出判定不再改写。
+            self.leak_register.append(oven, {"ts": self.clock.now(), **record})
+            self.bus.publish(
+                Event.of(
+                    "door",
+                    "door",
+                    "leak_verdict",
+                    severity=ACTION_SEVERITIES[judgment.action],
+                    message=f"{VERDICT_MESSAGES[judgment.verdict]}：{','.join(judgment.reasons)}",
+                    **record,
+                )
+            )
+            attempts.append(record)
+            if judgment.action != ACTION_RE_TIGHTEN:
+                break
+            self.door.latch.set_engaged()
+            retightens_used += 1
+        latest = attempts[-1]
+        return {"verdict": latest["verdict"], "decision": latest["decision"], "attempts": attempts}
+
+    def _latch_readback(self, injected: float | None, ok: bool, retightens_used: int) -> float | None:
+        """闩锁行程回读：回读失败返回 ``None``（部分失败），注入值只对首次判定生效。"""
+
+        if not ok:
+            return None
+        if injected is not None and retightens_used == 0:
+            return float(injected)
+        return self.door.latch.position_mm
+
+    def _pressure_after(self, injected: float | None, ok: bool, retightens_used: int) -> float | None:
+        """压紧后压力采样：采样失败返回 ``None``（部分失败），注入值只对首次判定生效。"""
+
+        if not ok:
+            return None
+        if injected is not None and retightens_used == 0:
+            return float(injected)
+        return self.collector.pressure_pa
+
+    def leak_status(self) -> dict:
+        """逐门最新泄漏判定结论：控制台展示与审计同源，判定粒度逐门独立。"""
+
+        return {"granularity": LEAK_GRANULARITY, "doors": self.leak_register.latest_all()}
+
+    def door_leak_history(self, oven: str) -> dict:
+        """单门泄漏判定历史：历史只追加不改写，供复查。"""
+
+        return {
+            "oven": oven,
+            "latest": self.leak_register.latest(oven),
+            "history": self.leak_register.history(oven),
+        }
 
     def cycle(self, dt: float = 1.0) -> dict:
         """推进一个控制周期，返回本周期摘要。"""
@@ -482,6 +616,7 @@ class Platform:
                 "latch_resets": self.flap.latch.resets(),
             },
             "door": {**self.door.snapshot().as_dict(), "latch_cycles": self.door.latch.cycles()},
+            "leak": self.leak_status(),
             "heating": self.heating_snapshot().as_dict(),
             "dust": self.dust_snapshot().as_dict(),
             "dust_starts": self.dust.starts(),

@@ -23,7 +23,7 @@ from .config import config_to_mapping, default_config, load_config
 from .console.server import ConsoleServer, probe_endpoints
 from .errors import CokeError
 
-DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/topology", "/api/audit")
+DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/topology", "/api/audit", "/api/leak")
 
 
 def _build(args: argparse.Namespace) -> Platform:
@@ -96,7 +96,11 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "quench": {"ok": quench["ok"], "steps": [step["action"] for step in quench["steps"]]},
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
-        "cleaning": {"ok": cleaning["ok"], "steps": [step["action"] for step in cleaning["steps"]]},
+        "cleaning": {
+            "ok": cleaning["ok"],
+            "steps": [step["action"] for step in cleaning["steps"]],
+            "leak": cleaning.get("leak", {}).get("verdict"),
+        },
         "concurrency": concurrency,
         "calibration": calibration,
         "shutdown": shutdown,
@@ -108,6 +112,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     for operation in (charge, reversal, push, quench, cleaning):
         if not operation["ok"]:
             failures.extend(operation["violations"])
+    # 清扫压紧后密封判定必须合格：泄漏或部分失败都不能放行。
+    leak = cleaning.get("leak") or {}
+    if leak.get("verdict") not in (None, "sealed"):
+        failures.append("leak_not_sealed")
     if failures:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1

@@ -37,6 +37,17 @@
       "latch_travel_mm": 60.0,
       "clean_duration_s": 45.0
     },
+    "leak": {
+      "travel_pass_mm": 58.0,
+      "travel_fail_mm": 54.0,
+      "dp_drop_pass_pa": 5.0,
+      "dp_drop_fail_pa": 15.0,
+      "on_uncertain": "re_tighten_once",
+      "max_retighten": 1,
+      "doors": {
+        "oven07": { "on_uncertain": "alarm", "max_retighten": 0 }
+      }
+    },
     "heating": {
       "reversal_interval_s": 1800.0,
       "temp_target_c": 1180.0,
